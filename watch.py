@@ -1,5 +1,5 @@
-import requests
-from fake_useragent import UserAgent
+from autodl_api import APIError, request_json
+from regions import region_name, selected_region_groups
 
 gpu2region = {
     'RTX 5090': [["west-B", "west-C"]],
@@ -35,22 +35,36 @@ gpu2region = {
 
 
 def watch_gpu(config, gpu):
-    url = 'https://www.autodl.com/api/v1/machine/region/gpu_type'
-    headers = {
-        'User-Agent': UserAgent().random,
-        'Authorization': config.Authorization
-    }
+    groups = selected_region_groups(config)
+    if not groups:
+        groups = [(codes, region_name(codes)) for codes in gpu2region.get(gpu, [])]
+    if not groups:
+        raise ValueError('该型号没有预设地区，请在配置中指定 region_sign_list')
     gpu_info = {}
-    for region in gpu2region[gpu]:
-        response = requests.post(url = url, headers = headers, json = {'region_sign_list': region}).json()
- 
-        for v in response['data']:
-            if list(v.keys())[0] == gpu:
-                gpu_info[str(region)] = {**{'gpu': gpu}, **v[list(v.keys())[0]]}
-     
+    for region, name in groups:
+        response = request_json(config, 'machine/region/gpu_type', {'region_sign_list': region})
+        if not isinstance(response['data'], list):
+            raise APIError('GPU 库存响应格式异常')
+        info = {'gpu': gpu, 'region_name': name, 'total_gpu_num': 0,
+                'idle_gpu_num': 0, 'listed': False}
+        for entry in response['data']:
+            if isinstance(entry, dict) and gpu in entry:
+                stats = entry[gpu]
+                if not isinstance(stats, dict):
+                    raise APIError('GPU 库存详情格式异常')
+                for key in ('total_gpu_num', 'idle_gpu_num'):
+                    value = stats.get(key)
+                    if type(value) is not int or value < 0:
+                        raise APIError('GPU 库存数量无效')
+                info.update(stats, listed=True)
                 break
-            else:
-                continue
+        gpu_info[str(region)] = info
     return gpu_info
+
+
+def available_regions(gpu_info, gpu_num=1):
+    """地区库存只是初筛，多卡需求还需查询单台机器是否满足。"""
+    return {region: info for region, info in gpu_info.items()
+            if info.get('idle_gpu_num', 0) >= gpu_num}
 
 

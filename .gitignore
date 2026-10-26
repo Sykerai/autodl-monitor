@@ -1,10 +1,14 @@
-# virtual enviroment
-/venv
+# Python environments and caches
+/venv/
+/.venv/
+__pycache__/
+*.py[cod]
 
-# config
+# Personal configuration and credentials
+/config.json
 config.py
 config copy.json
 
-# pycharm
-.idea
-__pycache__
+# Editor and operating-system files
+.idea/
+.DS_Store

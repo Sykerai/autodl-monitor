@@ -2,6 +2,9 @@ import hashlib
 from io import BytesIO
 from PIL import Image
 import json
+import time
+import os
+import tempfile
 from pathlib import Path
 
 import requests
@@ -9,9 +12,11 @@ import matplotlib.pyplot as plt
 from fake_useragent import UserAgent
 
 
-def update_config_authorization(token):
+def update_config_authorization(token, config_path=None):
     """更新配置文件中的 authorization"""
-    config_path = Path(__file__).parent.parent / 'config.json'
+    config_path = Path(config_path) if config_path is not None else Path(__file__).parent / 'config.json'
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError('登录结果缺少有效令牌，请重新扫码')
     
     if config_path.exists():
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -19,13 +24,45 @@ def update_config_authorization(token):
         
         config_data['authorization'] = token
         
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config_data, f, indent=2, ensure_ascii=False)
+        # 原子替换，防止写入被中断时破坏配置；保留刚刚修改过的其他选项。
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=config_path.parent, delete=False) as f:
+                temporary = f.name
+                json.dump(config_data, f, indent=2, ensure_ascii=False)
+                f.write('\n')
+            os.replace(temporary, config_path)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
     else:
-        print("配置文件不存在，无法更新 authorization")
+        raise FileNotFoundError("配置文件不存在，无法保存登录信息")
 
 
-def login_and_update_config(phone=None, password=None):
+def wait_for_wechat_ticket(headers, uuid, timeout=180):
+    """保持二维码窗口响应，直到手机确认登录或等待超时。"""
+    query_url = 'https://www.autodl.com/api/v1/wx/polling/query'
+    started = time.monotonic()
+    while True:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("等待微信登录超时，请重新运行并扫描新的二维码")
+        try:
+            response = requests.post(
+                url=query_url, headers=headers, json={'uuid': uuid},
+                timeout=min(10, remaining),
+            )
+            response.raise_for_status()
+            data = response.json().get('data') or {}
+            if data.get('ticket'):
+                return data['ticket']
+        except requests.Timeout:
+            pass
+        plt.pause(min(1, remaining))
+
+
+def login_and_update_config(phone=None, password=None, config_path=None):
     """登录并自动更新配置文件"""
     headers = {
         'User-Agent': UserAgent().random
@@ -41,40 +78,43 @@ def login_and_update_config(phone=None, password=None):
             'password': sha1.hexdigest(),
             'phone_area': '+86'
         }
-        response = requests.post(url=login_url, headers=headers, json=data).json()
+        response = requests.post(url=login_url, headers=headers, json=data, timeout=15).json()
         ticket = response['data']['ticket']
         # 2、获取token
         passport_url = 'https://www.autodl.com/api/v1/passport'
-        response = requests.post(url=passport_url, headers=headers, json={'ticket': ticket}).json()
+        response = requests.post(url=passport_url, headers=headers, json={'ticket': ticket}, timeout=15).json()
         token = response['data']['token']
         
         # 更新配置文件
-        update_config_authorization(token)
+        update_config_authorization(token, config_path=config_path)
         print(f"登录成功，authorization 已更新到配置文件")
         return token
         
     else:
         # 1、获取二维码和uuid
         login_url = 'https://www.autodl.com/api/v1/wx/login'
-        response = requests.get(url=login_url, headers=headers).json()
+        response = requests.get(url=login_url, headers=headers, timeout=15).json()
         qrcode_url = response['data']['qrcode_url']
         uuid = response['data']['uuid']
         # 2、获取ticket
-        response = requests.get(url=qrcode_url, headers=headers).content
+        response = requests.get(url=qrcode_url, headers=headers, timeout=15).content
         img = Image.open(BytesIO(response))
         plt.imshow(img)
         plt.axis('off')
-        plt.show()
-        query_url = 'https://www.autodl.com/api/v1/wx/polling/query'
-        response = requests.post(url=query_url, headers=headers, json={'uuid': uuid}).json()
-        ticket = response['data']['ticket']
+        plt.show(block=False)
+        plt.pause(0.1)
+        print("请使用微信扫描二维码，并在手机上确认登录；程序正在等待登录结果...", flush=True)
+        try:
+            ticket = wait_for_wechat_ticket(headers, uuid)
+        finally:
+            plt.close()
         # 3、获取token
         passport_url = 'https://www.autodl.com/api/v1/passport'
-        response = requests.post(url=passport_url, headers=headers, json={'ticket': ticket}).json()
+        response = requests.post(url=passport_url, headers=headers, json={'ticket': ticket}, timeout=15).json()
         token = response['data']['token']
         
         # 更新配置文件
-        update_config_authorization(token)
+        update_config_authorization(token, config_path=config_path)
         print(f"登录成功，authorization 已更新到配置文件")
         return token
 
