@@ -28,11 +28,12 @@ def list_instances(config):
 
 
 def show_instances(rows):
-    print('序号 | 实例ID | 所在机器 | GPU配置 | 状态', flush=True)
+    import terminal_ui as ui
+    ui.section('账号实例')
     for number, row in enumerate(rows, 1):
-        print(f"{number} | {row['uuid']} | {row.get('region_name', '')} / "
-              f"{row.get('machine_alias', '')} | {row.get('snapshot_gpu_alias_name', '')} × "
-              f"{row.get('req_gpu_amount', '?')} | {row.get('status', '未知')}", flush=True)
+        ui.option(number, f"{row.get('name') or row.get('machine_alias') or row['uuid']} · "
+                          f"{row.get('region_name', '')} · {row.get('snapshot_gpu_alias_name', '')} × "
+                          f"{row.get('req_gpu_amount', '?')} · {row.get('status', '未知')} · {row['uuid']}")
 
 
 def choose_source(config, instance_uuid='', *, interactive=True):
@@ -192,34 +193,25 @@ def matching_candidates(source, candidates):
 
 
 def preview_price(config, source, candidate):
-    data = request_json(config, 'order/price/preview', {
+    return _price_from_data(request_json(config, 'order/price/preview', {
         'machine_id': candidate['machine_id'], 'charge_type': 'payg',
         'num': source.gpu_num, 'expand_data_disk': candidate['expand_data_disk'],
-    })['data']
-    if not isinstance(data, dict):
-        raise APIError('克隆价格预览格式异常')
-    hourly = data.get('payg_price')
-    disk = data.get('data_disk_info') or {}
-    daily = disk.get('data_disk_deal_daily_price')
-    if type(hourly) not in (int, float) or not math.isfinite(hourly) or hourly < 0:
-        raise APIError('克隆价格预览缺少有效的 GPU 费用')
-    if candidate['expand_data_disk'] and (
-        type(daily) not in (int, float) or not math.isfinite(daily) or daily < 0
-    ):
-        raise APIError('克隆价格预览缺少有效的数据盘费用')
-    hourly = Decimal(str(hourly)) / 1000
-    daily = Decimal(str(daily or 0)) / 1000
-    # 与单卡机器原始标价不同，价格预览已包含卡数和账号折扣。
-    return {'gpu_hourly': hourly, 'disk_daily': daily,
-            'hourly_equivalent': hourly + daily / 24}
+    })['data'], candidate['expand_data_disk'])
+
+
+def _price_from_data(data, expansion):
+    from pricing import from_data
+    return from_data(data, expansion)
 
 
 def within_budget(config, source, candidates):
     if config.clone_max_price is None:
         return candidates
     maximum = Decimal(str(config.clone_max_price))
-    return [candidate for candidate in candidates
-            if preview_price(config, source, candidate)['hourly_equivalent'] <= maximum]
+    priced = [(preview_price(config, source, candidate)['hourly_equivalent'], index, candidate)
+              for index, candidate in enumerate(candidates)]
+    return [candidate for price, _, candidate in sorted(priced, key=lambda item: (item[0], item[1]))
+            if price <= maximum]
 
 
 def clone_once(config, source, candidates):
@@ -228,7 +220,7 @@ def clone_once(config, source, candidates):
     current = choose_source(config, source.uuid, interactive=False)
     if current.signature() != source.signature():
         raise ValueError('源实例配置已变化，请重新启动并选择源实例')
-    for candidate in matching_candidates(source, candidates):
+    for candidate in within_budget(config, source, matching_candidates(source, candidates)):
         price = preview_price(config, source, candidate)
         if price['hourly_equivalent'] > Decimal(str(config.clone_max_price)):
             continue

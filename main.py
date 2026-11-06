@@ -14,10 +14,56 @@ from autodl_api import APIError, AuthenticationError, PurchaseUncertainError
 from config_loader import Config
 from desktop_alert import DesktopAlert
 from regions import region_name, split_region_arguments
+import terminal_ui as ui
 
 
 def log(message):
-    print(f'[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}', flush=True)
+    ui.message(message)
+
+
+def announce(config, popup, title, message):
+    rows, notes = [], []
+    for line in message.splitlines():
+        if '：' in line and len(line.split('：', 1)[0]) <= 8:
+            rows.append(tuple(line.split('：', 1)))
+        elif line.strip():
+            notes.append(line)
+    style = ('error' if '失败' in title else 'warning' if '待确认' in title or '需要处理' in title
+             else 'success' if '成功' in title or '已就绪' in title else 'accent')
+    ui.panel(f'{title} · {datetime.now():%H:%M:%S}', [(None, rows)] if rows else [], notes=notes, style=style)
+    try:
+        if not popup.show(title, message, force=True) and popup.error:
+            log(popup.error)
+    except Exception:
+        log('本机弹窗未能显示，请以上述终端结果为准')
+    try:
+        sent = notifications.send_notification(config, title, message)
+        if config.sendkey and not sent:
+            log('微信通知发送失败；不会因此重复创建实例')
+    except Exception:
+        log('微信通知发送失败；不会因此重复创建实例')
+
+
+def record_outcome(config, outcome):
+    journal = getattr(config, 'task_journal', None)
+    if journal is not None:
+        status = outcome['status'] if outcome['status'] in ('completed', 'failed') else 'tracking'
+        journal.write(status=status, outcome=outcome)
+
+
+def finish_new(config, popup, result):
+    from instance_status import wait
+    context = (f"地区：{result['region_name']}\nGPU：{config.gpu_model} × {config.gpu_num}\n"
+               f"新实例：{result['instance_uuid']}\n")
+    announce(config, popup, '新建请求已受理', context + '平台正在准备实例，将继续跟踪，不再下单。')
+    try:
+        outcome = wait(config, result['instance_uuid'], report=log)
+    except (Exception, KeyboardInterrupt):
+        outcome = {'status': 'pending', 'message': '暂时无法确认结果，可从主菜单恢复跟踪；不会再次下单'}
+    record_outcome(config, outcome)
+    title = {'completed': '新实例已就绪', 'failed': '实例创建失败', 'pending': '实例进度待确认'}[outcome['status']]
+    announce(config, popup, title, context + outcome['message'])
+    return {'completed': 0, 'failed': 1, 'pending': 2}[outcome['status']]
 
 
 def finish_clone(config, popup, source, result):
@@ -25,23 +71,10 @@ def finish_clone(config, popup, source, result):
     context = (f'地区：{result["region_name"]}\nGPU：{config.gpu_model} × {config.gpu_num}\n'
                f'源实例：{source.uuid}\n新实例：{result["instance_uuid"]}\n')
 
-    def announce(title, message):
-        log(f'{title}：{message}')
-        log(f'新实例ID：{result["instance_uuid"]}')
-        try:
-            shown = popup.show(title, context + '\n' + message, force=True)
-            if not shown and popup.error:
-                log(popup.error)
-        except Exception:
-            log('本机结果弹窗未能显示，请以上述终端结果为准')
-        try:
-            sent = notifications.send_notification(config, title, context + '\n' + message)
-            if config.sendkey and not sent:
-                log('微信通知发送失败；不会因此重复克隆')
-        except Exception:
-            log('微信通知发送失败；不会因此重复克隆')
+    def clone_announce(title, message):
+        announce(config, popup, title, context + '\n' + message)
 
-    announce('克隆请求已受理', '平台正在创建新实例并复制数据。此时尚未确认复制完成；程序将继续跟踪进度，不再下单。')
+    clone_announce('克隆请求已受理', '平台正在创建新实例并复制数据。此时尚未确认复制完成；程序将继续跟踪进度，不再下单。')
     try:
         outcome = cloning.wait_for_completion(config, result['instance_uuid'], report=log)
     except KeyboardInterrupt:
@@ -51,7 +84,8 @@ def finish_clone(config, popup, source, result):
         outcome = {'status': 'pending', 'message': '暂时无法确认复制结果，请到官网查看新实例；不会重新下单'}
     title = {'completed': '克隆成功 · 数据复制完成',
              'failed': '克隆或数据复制失败', 'pending': '克隆进度待确认'}[outcome['status']]
-    announce(title, outcome['message'])
+    record_outcome(config, outcome)
+    clone_announce(title, outcome['message'])
     return {'completed': 0, 'failed': 1, 'pending': 2}[outcome['status']]
 
 
@@ -59,16 +93,20 @@ def monitor(config, *, once=False):
     popup = DesktopAlert(enabled=config.desktop_popup, cooldown=config.popup_cooldown)
     last_notification = None
     failures = 0
+    started = time.monotonic()
+    journal = getattr(config, 'task_journal', None)
+    checks = journal.data.get('checks', 0) if journal else 0
     while True:
         try:
+            checks += 1
+            elapsed = int(time.monotonic() - started)
+            if journal:
+                created = journal.data.get('created_at')
+                if created:
+                    from datetime import timezone
+                    elapsed = max(0, int((datetime.now(timezone.utc) - datetime.fromisoformat(created)).total_seconds()))
+                journal.write(checks=checks)
             snapshot = watch.watch_gpu(config, config.gpu_model)
-            for region, info in snapshot.items():
-                name = info.get('region_name', region_name(region))
-                if info.get('listed', True):
-                    log(f'{name} | {config.gpu_model} | '
-                        f"总计 {info['total_gpu_num']} 张，空闲 {info['idle_gpu_num']} 张")
-                else:
-                    log(f'{name} | 该区域当前未列出 {config.gpu_model}')
 
             scan_started = time.monotonic()
             candidates = gpu.find_candidates(config, snapshot)
@@ -82,15 +120,11 @@ def monitor(config, *, once=False):
             scan_seconds = time.monotonic() - scan_started
             failures = 0
             delay = config.interval
+            ui.scan(config, snapshot, candidates, checks=checks, elapsed=elapsed,
+                    scan_seconds=scan_seconds, rentable_count=rentable_count, same_config_count=same_config_count)
             if candidates:
                 idle = sum(machine['gpu_idle_num'] for machine in candidates)
-                summary_idle = sum(info['idle_gpu_num'] for info in snapshot.values())
-                if idle != summary_idle:
-                    log(f'汇总快照空闲 {summary_idle} 张，本轮可租机器明细空闲 {idle} 张'
-                        f'（检查耗时 {scan_seconds:.1f} 秒）；本次按机器明细判断')
-                log(f'发现可用GPU：{len(candidates)} 台机器满足每台 {config.gpu_num} 张的需求'
-                    f'（这些可租机器共空闲 {idle} 张）')
-                if not once:
+                if not once and config.mode == 'monitor_only':
                     names = ', '.join(dict.fromkeys(
                         machine.get('region_name', region_name(machine['region']))
                         for machine in candidates
@@ -118,19 +152,7 @@ def monitor(config, *, once=False):
                     if result['success']:
                         if config.mode == 'monitor_and_clone':
                             return finish_clone(config, popup, source, result)
-                        log(f"{result['message']}，地区：{result['region_name']}，"
-                            f"机器ID：{result['machine_id']}")
-                        if result.get('instance_uuid'):
-                            log(f"新实例ID：{result['instance_uuid']}；克隆及数据复制进度请在官网查看")
-                        sent = notifications.send_notification(
-                            config, f'GPU实例创建请求成功 - {config.gpu_model}',
-                            f"{result['message']}\n地区：{result['region_name']}\n"
-                            f"机器ID：{result['machine_id']}\n实际费用请在 AutoDL 控制台查看。",
-                            snapshot,
-                        )
-                        if config.sendkey:
-                            log('微信通知已发送' if sent else '微信通知发送失败，实例已创建，请查看控制台')
-                        return 0  # 成功后退出，通知失败也绝不再次购买。
+                        return finish_new(config, popup, result)
                     log(result['message'])
                     delay = config.retry_interval
                 else:
@@ -148,25 +170,8 @@ def monitor(config, *, once=False):
                         last_notification = now
                     if config.stop_after_found:
                         return 0
-            else:
-                summary_idle = sum(info['idle_gpu_num'] for info in snapshot.values())
-                if summary_idle >= config.gpu_num and rentable_count == 0:
-                    log(f'地区汇总显示空闲 {summary_idle} 张，但本轮机器明细未找到可租机器'
-                        f'（明细检查耗时 {scan_seconds:.1f} 秒）；两次查询间库存可能变化，'
-                        '也可能是汇总与明细不同步或机器不可租')
-                    counts = getattr(config, 'machine_scan', {})
-                    if counts:
-                        log(f"机器明细：检查 {counts['examined']} 台；不可租状态 {counts['disabled']} 台，"
-                            f"实例容量已满 {counts['capacity_full']} 台，空闲卡不足 {counts['insufficient_idle']} 台")
-                if source is not None:
-                    if rentable_count:
-                        log(f'可租机器 {rentable_count} 台 → 同配置 {same_config_count} 台'
-                            f' → 符合费用上限 {len(candidates)} 台')
-                    log('暂未找到同配置且符合费用上限的可租机器')
-                elif summary_idle < config.gpu_num:
-                    log('暂无可用GPU，继续监控...' if not once else '暂无可用GPU')
         except (AuthenticationError, PurchaseUncertainError) as exc:
-            log(str(exc))
+            announce(config, popup, '任务需要处理', str(exc))
             return 2
         except (APIError, requests.RequestException) as exc:
             failures += 1
@@ -177,14 +182,15 @@ def monitor(config, *, once=False):
             delay = min(config.interval * 2 ** min(failures - 1, 4), 300)
         if once:
             return 0
-        log(f'{delay:g} 秒后再次检查，按 Ctrl+C 停止')
+        ui.hint(f'{delay:g} 秒后再次检查  ·  Ctrl+C 停止')
         time.sleep(delay)
 
 
-def main(argv=None):
+def cli_main(argv=None):
     parser = argparse.ArgumentParser(description='autodl-monitor：AutoDL GPU 库存监控与自动租用')
     parser.add_argument('--once', action='store_true', help='只查询一次，不创建付费实例')
     parser.add_argument('--login', action='store_true', help='重新扫码登录')
+    parser.add_argument('--config', default='config.json', help='高级用法：指定本地配置位置')
     parser.add_argument('--region', nargs='+', help='本次查询的地区名称或代码，例如 北京B区 或 bj-B1')
     parser.add_argument('--gpu', help='本次查询的 GPU 型号，例如 "RTX 5090"')
     parser.add_argument('--interval', type=float, help='查询间隔秒数，大于 0')
@@ -194,11 +200,15 @@ def main(argv=None):
     actions.add_argument('--list-instances', action='store_true', help='读取当前账号的源实例列表')
     actions.add_argument('--clone-preview', action='store_true', help='选择源实例并预览同配置克隆计划，不下单')
     actions.add_argument('--clone', action='store_true', help='选择源实例，确认后监控并克隆一次，含数据盘')
+    actions.add_argument('--buy', action='store_true', help='监控并新建一个实例，启动前确认')
+    actions.add_argument('--buy-preview', action='store_true', help='预览普通新建计划，不下单')
+    parser.add_argument('--num', type=int, help='每台需求卡数，1～8')
+    parser.add_argument('--extra-disk', type=int, help='新建时额外增加的数据盘容量，GB')
     parser.add_argument('--source', help='本次使用的源实例ID；省略时启动后交互选择')
-    parser.add_argument('--max-price', type=float, help='克隆每小时总费用折算上限，含数据盘日费÷24')
+    parser.add_argument('--max-price', type=float, help='新建/克隆整实例每小时费用折算上限')
     args = parser.parse_args(argv)
     try:
-        config = Config()
+        config = Config() if args.config == 'config.json' else Config(args.config)
         if args.no_popup:
             config.desktop_popup = False
         if args.test_popup:
@@ -221,6 +231,16 @@ def main(argv=None):
             if not math.isfinite(args.interval) or args.interval <= 0:
                 raise ValueError('--interval 必须大于 0 且为有限数字')
             config.interval = args.interval
+        if args.num is not None:
+            if not 1 <= args.num <= 8:
+                raise ValueError('--num 必须是 1～8')
+            config.gpu_num = args.num
+        if args.extra_disk is not None:
+            if not 0 <= args.extra_disk <= 100000:
+                raise ValueError('--extra-disk 必须是非负整数 GB')
+            config.expand_data_disk_gib = args.extra_disk
+        if args.buy or args.buy_preview:
+            config.mode = 'monitor_and_buy'
         if args.login or not config.has_authorization():
             if args.once and not args.login:
                 log('尚未登录，请先使用 --login 扫码登录')
@@ -231,8 +251,18 @@ def main(argv=None):
             cloning.show_instances(cloning.list_instances(config))
             return 0
         clone_mode = args.clone or args.clone_preview or config.mode == 'monitor_and_clone'
-        if (args.source or args.max_price is not None) and not clone_mode:
-            raise ValueError('--source 和 --max-price 请与 --clone 或 --clone-preview 一起使用')
+        if args.extra_disk is not None and config.mode != 'monitor_and_buy':
+            raise ValueError('--extra-disk 仅用于普通新建')
+        if args.source and not clone_mode:
+            raise ValueError('--source 请与 --clone 或 --clone-preview 一起使用')
+        if (args.num is not None or args.extra_disk is not None) and clone_mode:
+            raise ValueError('克隆卡数和磁盘由源实例决定，不能覆盖')
+        if args.max_price is not None:
+            if not math.isfinite(args.max_price) or args.max_price <= 0:
+                raise ValueError('--max-price 必须是大于 0 的有限数字')
+            if not clone_mode and config.mode != 'monitor_and_buy':
+                raise ValueError('--max-price 仅用于自动新建或克隆')
+            config.max_price_per_hour = args.max_price
         if clone_mode:
             if args.gpu or args.region:
                 raise ValueError('同配置克隆的地区、GPU 型号和卡数由源实例决定，请不要同时指定 --gpu 或 --region')
@@ -245,7 +275,8 @@ def main(argv=None):
                 interactive=sys.stdin.isatty(),
             )
             cloning.prepare_config(config, source)
-            print(cloning.describe_source(source), flush=True)
+            from interactive import source_panel
+            source_panel(source)
             if config.clone_max_price is not None:
                 log(f'总费用折算上限：{config.clone_max_price:g} 元/小时（含数据盘日费÷24）')
             if args.clone_preview:
@@ -264,6 +295,21 @@ def main(argv=None):
                     log('已取消，未启动克隆')
                     return 0
             config.mode = 'monitor_and_clone'
+            config.clone_source_uuid = source.uuid
+        elif config.mode == 'monitor_and_buy' and not args.once:
+            from interactive import summary
+            summary(config)
+            if args.buy_preview:
+                log('以上仅为新建计划，未创建实例')
+                return 0
+            if not sys.stdin.isatty() or input('输入 BUY 确认创建一个付费实例，其余取消：').strip() != 'BUY':
+                log('已取消；自动新建需要在终端确认')
+                return 0
+        if config.mode in ('monitor_and_clone', 'monitor_and_buy') and not args.once:
+            from task_store import TaskStore, task_plan
+            journal = TaskStore(config.state_dir / 'task.json')
+            journal.start(task_plan(config))
+            config.task_journal = journal
         mode = '单次查询（不购买）' if args.once else (
             {'monitor_only': '仅监控', 'monitor_and_buy': '监控并购买',
              'monitor_and_clone': '监控并克隆一次（含数据盘）'}[config.mode]
@@ -271,7 +317,8 @@ def main(argv=None):
         selected = ', '.join(config.region_names + [
             region_name([code]) for code in config.region_sign_list
         ]) or '型号预设地区'
-        log(f'运行模式：{mode} | 地区：{selected} | GPU：{config.gpu_model} | 需求：{config.gpu_num} 张')
+        ui.panel('任务已启动', [(None, [('运行模式', mode), ('地区', selected),
+                                      ('GPU', f'{config.gpu_model} × {config.gpu_num} 张')])])
         if config.desktop_popup and not args.once:
             log(f'本机弹窗已开启，重复提醒间隔至少 {config.popup_cooldown:g} 秒')
         if not config.sendkey:
@@ -289,6 +336,29 @@ def main(argv=None):
             log('无法读取或保存配置，请检查文件权限')
         else:
             log(str(exc))
+        return 2
+
+
+def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if '--help' in arguments or '-h' in arguments:
+        return cli_main(arguments)
+    # The default is always the menu, irrespective of the last stored purchase mode.
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument('--config', default='config.json')
+    location, remainder = selector.parse_known_args(arguments)
+    from pathlib import Path
+    from local_state import process_lock
+    path = (Path(__file__).parent / location.config).resolve()
+    try:
+        with process_lock(path.parent / '.autodl-monitor'):
+            if not remainder:
+                from interactive import run
+                config = Config() if location.config == 'config.json' else Config(location.config)
+                return run(config)
+            return cli_main(arguments)
+    except (ValueError, OSError) as exc:
+        log(str(exc) if isinstance(exc, ValueError) else '无法读写本地记录，请检查文件权限和磁盘')
         return 2
 
 

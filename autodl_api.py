@@ -18,6 +18,36 @@ class PurchaseUncertainError(APIError):
 
 
 def request_json(config, path, payload=None, *, purchase=False, method='POST'):
+    journal = getattr(config, 'task_journal', None) if purchase else None
+    if journal is None:
+        return _request_json(config, path, payload, purchase=purchase, method=method)
+    # Record the pre-request instance set so a lost response can be reviewed after restart.
+    from cloning import list_instances
+    previous = [row['uuid'] for row in list_instances(config)]
+    journal.submit(path, payload, previous)
+    try:
+        response = _request_json(config, path, payload, purchase=True, method=method)
+        if response['code'] != 'Success':
+            # Only known inventory rejections are safe to reattempt automatically.
+            if response['code'] in ('NoStock', 'SoldOut', 'InsufficientGPU', 'MachineNotAvailable', 'InstanceCapacityFull'):
+                journal.write(status='waiting')
+                return response
+            raise PurchaseUncertainError('平台未明确确认创建结果；已暂停下单，请先核实实例和账号状态')
+        instance_uuid = response.get('data')
+        if not isinstance(instance_uuid, str) or not instance_uuid.strip() or instance_uuid in previous:
+            raise PurchaseUncertainError('创建响应缺少有效的新实例ID，请先核实平台，不能重复购买')
+        journal.write(status='accepted', result={
+            'instance_uuid': instance_uuid, 'machine_id': payload['instance_info']['machine_id'],
+        })
+        return response
+    except BaseException:
+        # If the write itself fails, the already-durable "submitting" record still blocks retries.
+        if journal.data['status'] == 'submitting':
+            journal.write(status='uncertain')
+        raise
+
+
+def _request_json(config, path, payload=None, *, purchase=False, method='POST'):
     attempts = 1 if purchase else getattr(config, 'max_retries', 2) + 1
     for attempt in range(attempts):
         try:
@@ -30,7 +60,7 @@ def request_json(config, path, payload=None, *, purchase=False, method='POST'):
                 **arguments, timeout=getattr(config, 'request_timeout', 15),
             )
             if response.status_code in (401, 403):
-                raise AuthenticationError('登录已失效，请使用 --login 重新扫码登录')
+                raise AuthenticationError('登录已失效，请在登录菜单更新凭证，或使用 --login 重新扫码登录')
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, dict) or 'code' not in body:
@@ -60,8 +90,9 @@ def request_json(config, path, payload=None, *, purchase=False, method='POST'):
             auth_text = f'{code} {message}'.lower()
             if code in ('401', '403') or any(word in auth_text for word in (
                 'unauth', 'notlogin', 'not_login', 'token', '登录', '登陆', '未认证',
+                'authorizefailed', 'authenticationfailed', 'authfailed', '授权',
             )):
-                raise AuthenticationError('登录已失效，请使用 --login 重新扫码登录')
+                raise AuthenticationError('登录已失效，请在登录菜单更新凭证，或使用 --login 重新扫码登录')
             if purchase:
                 return body
             raise APIError('AutoDL 拒绝了查询，请确认账号状态和地区配置')

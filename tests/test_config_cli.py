@@ -11,6 +11,11 @@ from config_loader import Config
 
 
 class ConfigAndCLITests(unittest.TestCase):
+    def setUp(self):
+        lock = patch('local_state.process_lock', side_effect=lambda directory: contextlib.nullcontext())
+        lock.start()
+        self.addCleanup(lock.stop)
+
     def test_popup_preview_never_logs_in_or_checks_inventory(self):
         with patch('main.DesktopAlert') as popup, \
                 patch('main.monitor') as monitor, \

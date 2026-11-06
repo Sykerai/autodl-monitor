@@ -96,9 +96,10 @@ class APITests(unittest.TestCase):
 
     def test_unknown_region_order_does_not_crash_after_creation(self):
         candidates = [{'machine_id': 'test-machine', 'machine_price': 1000,
-                       'region': "['future-region']"}]
-        with patch('gpu.request_json', return_value={'code': 'Success'}) as post:
-            result = gpu.buy(settings(), 'RTX 5090', 1, '', '',
+                       'region': "['future-region']", 'details': {'gpu_name': 'RTX 5090'}}]
+        with patch('gpu.request_json', return_value={'code': 'Success', 'data': 'new-instance'}) as post, \
+                patch('pricing.preview', return_value={'hourly_equivalent': __import__('decimal').Decimal('1')}):
+            result = gpu.buy(settings(max_price_per_hour=3), 'RTX 5090', 1, 'legacy-image', '',
                              gpu_info={}, candidates=candidates)
         self.assertTrue(result['success'])
         self.assertEqual(result['region_name'], 'future-region')

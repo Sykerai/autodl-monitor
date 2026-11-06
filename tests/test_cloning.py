@@ -50,6 +50,11 @@ def candidate():
 
 
 class CloningTests(unittest.TestCase):
+    def setUp(self):
+        lock = patch('local_state.process_lock', side_effect=lambda directory: contextlib.nullcontext())
+        lock.start()
+        self.addCleanup(lock.stop)
+
     def test_live_source_selection_uses_current_list_not_a_fixed_instance(self):
         with patch('cloning.list_instances', return_value=[row('first'), row('second')]), \
                 patch('builtins.input', return_value='2'), \
@@ -183,6 +188,7 @@ class CloningTests(unittest.TestCase):
         with patch('cloning.choose_source', return_value=src), \
                 patch('sys.stdin.isatty', return_value=True), \
                 patch('builtins.input', return_value='CLONE'), \
+                patch('task_store.TaskStore'), \
                 patch('main.monitor', return_value=0) as monitor, \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(main.main(['--clone', '--source', src.uuid, '--max-price', '3']), 0)

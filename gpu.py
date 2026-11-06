@@ -1,6 +1,8 @@
 from autodl_api import APIError, request_json
 from regions import REGION_NAMES, region_codes, region_name
 from watch import watch_gpu
+from decimal import Decimal
+import pricing
 
 
 region2name = {str(list(codes)): name for codes, name in REGION_NAMES.items()}
@@ -57,6 +59,7 @@ def get_machine_info(config, gpu, region, gpu_num, *, diagnostics=None):
                                      'gpu_name', 'gpu_memory', 'cpu_arch', 'chip_corp',
                                      'cpu_per_gpu', 'mem_per_gpu', 'max_instance_disk_size',
                                      'max_data_disk_expand_size', 'highest_cuda_version',
+                                     'driver_version',
                                  )}})
             else:
                 counts['insufficient_idle'] += 1
@@ -83,29 +86,76 @@ def find_candidates(config, gpu_info):
     return candidates
 
 
+def compatible_candidates(config, candidates):
+    selection = getattr(config, 'image_selection', None)
+    expansion = getattr(config, 'expand_data_disk_gib', 0) * pricing.GIB
+    result = []
+    from cloning import cuda_version
+    for machine in candidates:
+        details = machine.get('details', {})
+        if details.get('gpu_name') != config.gpu_model:
+            continue
+        maximum = details.get('max_data_disk_expand_size')
+        if expansion and (type(maximum) is not int or maximum < expansion):
+            continue
+        if selection:
+            if any(details.get(key) != selection[key] for key in ('cpu_arch', 'chip_corp')):
+                continue
+            required = selection.get('cuda_version')
+            if required:
+                current, minimum = cuda_version(details.get('highest_cuda_version')), cuda_version(required)
+                if current is None or minimum is None or current < minimum:
+                    continue
+        result.append(dict(machine, expand_data_disk=expansion))
+    return result
+
+
 def buy(config, gpu, gpu_num, image, private_image_uuid, *, gpu_info=None, candidates=None):
     snapshot = watch_gpu(config, gpu) if gpu_info is None else gpu_info
     if candidates is None:
         candidates = find_candidates(config, snapshot)
     result = {'success': False, 'message': '当前没有满足条件的可租机器',
               'gpu_info': snapshot}
+    from catalog import refresh_image
+    refresh_image(config)
+    maximum = getattr(config, 'max_price_per_hour', None)
+    candidates = pricing.ranked(config, compatible_candidates(config, candidates), gpu_num,
+                                maximum=maximum)
+    selection = getattr(config, 'image_selection', None)
+    if selection:
+        image_fields = {('base_image_uuid' if selection['kind'] == 'base' else 'private_image_uuid'): selection['uuid']}
+    elif private_image_uuid:
+        image_fields = {'private_image_uuid': private_image_uuid}
+    elif image:
+        image_fields = {'image': image}  # Legacy command/config compatibility only.
+    else:
+        raise ValueError('请先在新建菜单中选择镜像')
     for machine in candidates:
         machine_id = machine['machine_id']
+        expansion = machine['expand_data_disk']
+        price = pricing.preview(config, machine, gpu_num, expansion)
+        if price['hourly_equivalent'] > Decimal(str(maximum)):
+            continue
         response = request_json(config, 'order/instance/create/payg', {
             'instance_info': {
-                'charge_type': 'payg', 'expand_data_disk': 0,
-                'image': image or 'hub.kce.ksyun.com/autodl-image/torch:cuda12.4-cudnn-devel-ubuntu22.04-py312-torch2.5.1',
+                **image_fields,
+                'charge_type': 'payg', 'expand_data_disk': expansion,
                 'machine_id': machine_id, 'req_gpu_amount': gpu_num,
-                'private_image_uuid': private_image_uuid,
             },
-            'price_info': {'charge_type': 'payg', 'expand_data_disk': 0,
+            'price_info': {'charge_type': 'payg', 'expand_data_disk': expansion,
+                           'duration': 1, 'coupon_id_list': [],
                            'machine_id': machine_id, 'num': gpu_num},
         }, purchase=True)
         if response['code'] == 'Success':
+            from autodl_api import PurchaseUncertainError
+            instance_uuid = response.get('data')
+            if not isinstance(instance_uuid, str) or not instance_uuid.strip():
+                raise PurchaseUncertainError('新建请求已返回成功，但实例ID缺失；请核实平台，不能重复创建')
             result.update(success=True, machine_id=machine_id,
+                          instance_uuid=instance_uuid,
                           region=machine['region'],
                           region_name=machine.get('region_name', region_name(machine['region'])),
-                          price=machine['machine_price'] / 1000,
+                          price=float(price['hourly_equivalent']),
                           message=f'已创建包含 {gpu_num} 张 {gpu} 的实例')
             return result
     return result

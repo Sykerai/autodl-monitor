@@ -3,13 +3,12 @@ from io import BytesIO
 from PIL import Image
 import json
 import time
-import os
-import tempfile
 from pathlib import Path
 
 import requests
 import matplotlib.pyplot as plt
 from fake_useragent import UserAgent
+from local_state import atomic_json
 
 
 def update_config_authorization(token, config_path=None):
@@ -24,18 +23,7 @@ def update_config_authorization(token, config_path=None):
         
         config_data['authorization'] = token
         
-        # 原子替换，防止写入被中断时破坏配置；保留刚刚修改过的其他选项。
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
-                                             dir=config_path.parent, delete=False) as f:
-                temporary = f.name
-                json.dump(config_data, f, indent=2, ensure_ascii=False)
-                f.write('\n')
-            os.replace(temporary, config_path)
-        finally:
-            if temporary and os.path.exists(temporary):
-                os.unlink(temporary)
+        atomic_json(config_path, config_data)
     else:
         raise FileNotFoundError("配置文件不存在，无法保存登录信息")
 

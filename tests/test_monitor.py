@@ -204,7 +204,8 @@ class MonitorRegressionTests(unittest.TestCase):
         with patch('watch.watch_gpu', return_value=snapshot(1)), \
                 patch('gpu.find_candidates', return_value=[{'machine_id': 'test', 'gpu_idle_num': 1, 'region': "['bj-B1']"}]), \
                 patch('gpu.buy', return_value={'success': True, 'message': '创建成功',
-                      'region_name': '北京B区', 'machine_id': 'test'}) as buy, \
+                      'region_name': '北京B区', 'machine_id': 'test', 'instance_uuid': 'new-id'}) as buy, \
+                patch('instance_status.wait', return_value={'status': 'completed', 'message': '实例已就绪'}), \
                 patch('notifications.send_notification', return_value=False):
             self.assertEqual(main.monitor(settings(mode='monitor_and_buy', sendkey='test-key')), 0)
         buy.assert_called_once()

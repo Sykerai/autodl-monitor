@@ -1,14 +1,17 @@
 {
   "authorization": "",
   "mode": "monitor_only",
-  "region_names": ["北京B区"],
+  "region_names": [
+    "北京B区"
+  ],
   "gpu": {
     "model": "RTX 5090",
     "num": 1
   },
   "image": {
+    "autodl_image": "",
     "private_image_uuid": "",
-    "autodl_image": "hub.kce.ksyun.com/autodl-image/torch:cuda11.8-cudnn8-devel-ubuntu20.04-py38-torch2.0.0"
+    "selection": null
   },
   "monitor": {
     "interval": 30,
@@ -19,7 +22,7 @@
   },
   "clone": {
     "source_instance_uuid": "",
-    "max_price_per_hour": null,
+    "max_price_per_hour": 3,
     "completion_timeout_seconds": 3600,
     "status_interval_seconds": 10
   },
@@ -28,5 +31,9 @@
     "popup_cooldown_seconds": 300,
     "sendkey": "",
     "cooldown_seconds": 300
+  },
+  "purchase": {
+    "max_price_per_hour": 3,
+    "extra_data_disk_gib": 0
   }
 }
